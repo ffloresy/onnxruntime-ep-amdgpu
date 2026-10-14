@@ -24,6 +24,7 @@ struct ProviderInfo {
     std::optional<int> device_id{};
     std::optional<bool> disable_caching{};
     std::optional<bool> force_recompile{};
+    std::optional<bool> precompile_at_load{};
     std::optional<bool> exhaustive_tune{};
     // Relayed verbatim to the migraphx backend, which validates it.
     std::optional<std::string> compute_mode{};
