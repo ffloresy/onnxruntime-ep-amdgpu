@@ -491,7 +491,6 @@ add_custom_command(TARGET directx-ep POST_BUILD
 target_include_directories(directx-ep PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/External
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/OperatorAuthorHelper
     ${CMAKE_CURRENT_SOURCE_DIR}/core/mlas/inc
     ${CMAKE_CURRENT_SOURCE_DIR}/core/mlas/lib
