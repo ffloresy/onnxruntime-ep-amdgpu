@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -44,6 +45,20 @@ struct StaticSeqContext {
 // Parse the output index from a MIGraphX output parameter name ("#output_0").
 // Returns -1 if the name is not an output parameter.
 int ComputeOutputIndex(std::string_view name);
+
+// Map MIGraphX #output_N onto the ORT fused-node GetOutput slot.  The compiled
+// program keeps N as its parameter index; only the ORT hook is remapped.
+inline std::size_t OrtIndexForMgxOutput(const std::vector<std::size_t>& mgx_to_ort,
+    std::size_t mgx_index)
+{
+    if (mgx_to_ort.empty()) {
+        return mgx_index;
+    }
+    if (mgx_index >= mgx_to_ort.size()) {
+        throw std::runtime_error("MIGraphX output index exceeds ORT remap table");
+    }
+    return mgx_to_ort[mgx_index];
+}
 
 // ── Scratch buffer management ────────────────────────────────────────────────
 // MIGraphX programs expose a "scratch" parameter.  If the EP doesn't bind it,
@@ -133,7 +148,8 @@ StagingBindResult BindStagingParams(ComputeState& cs,
 void CopyStagingOutputsToOrt(const StagingBindResult& bind,
     const Ort::KernelContext& ctx, hipStream_t stream,
     const DynamicBatchContext& dyn,
-    const StaticSeqContext& seq);
+    const StaticSeqContext& seq,
+    const std::vector<std::size_t>& mgx_to_ort);
 
 // Free all staging buffers and reset the allocation flag (used when the program
 // is recompiled for a new shape so buffers are re-sized on next use).  Buffers are
@@ -208,6 +224,7 @@ void RunProgramOrHipGraphDirect(ComputeState& cs, hipStream_t stream,
 // path would otherwise materialize; the eager run paths (staging / direct / no-graph)
 // share this to avoid three copies of the same gather-and-copy loop.
 void CopyUnboundOutputsToOrt(const Ort::KernelContext& ctx, hipStream_t stream,
-    migraphx::arguments& outputs, const std::vector<std::size_t>& prog_output_indices);
+    migraphx::arguments& outputs, const std::vector<std::size_t>& prog_output_indices,
+    const std::vector<std::size_t>& mgx_to_ort);
 
 }  // namespace mgx_ep

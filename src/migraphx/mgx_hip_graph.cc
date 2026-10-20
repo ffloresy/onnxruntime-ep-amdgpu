@@ -94,7 +94,8 @@ std::size_t InferCompiledBatchFromParams(const migraphx::program_parameter_shape
 // Their device pointers are stable across replays because the graph replays the
 // same kernels into the same MIGraphX-managed memory.
 void MaterializeExtraOutputs(const Ort::KernelContext& ctx, hipStream_t stream,
-    const std::vector<CapturedHipGraph::ExtraOutput>& extras, const DynamicBatchContext& dyn)
+    const std::vector<CapturedHipGraph::ExtraOutput>& extras, const DynamicBatchContext& dyn,
+    const std::vector<std::size_t>& mgx_to_ort)
 {
     // Report the cached (bind-time) shape directly in the common no-slice case; only a
     // batched extra output needs a shrunk shape, built on a per-thread reusable buffer so
@@ -116,7 +117,8 @@ void MaterializeExtraOutputs(const Ort::KernelContext& ctx, hipStream_t stream,
             report_shape = &sliced_shape;
         }
 
-        auto output_tensor{ctx.GetOutput(extra.output_index, report_shape->data(), report_shape->size())};
+        auto output_tensor{ctx.GetOutput(OrtIndexForMgxOutput(mgx_to_ort, extra.output_index),
+            report_shape->data(), report_shape->size())};
         void* dst{output_tensor.GetTensorMutableRawData()};
         if (bytes > 0) {
             // Stream-ordered async D2D, matching CopyStagingOutputsToOrt on this same
@@ -1204,7 +1206,8 @@ StagingBindResult BindStagingParams(ComputeState& cs,
 void CopyStagingOutputsToOrt(const StagingBindResult& bind,
     const Ort::KernelContext& ctx, hipStream_t stream,
     const DynamicBatchContext& dyn,
-    const StaticSeqContext& seq)
+    const StaticSeqContext& seq,
+    const std::vector<std::size_t>& mgx_to_ort)
 {
     for (std::size_t i{}; i < bind.prog_output_indices.size() &&
         i < bind.bound_output_shapes.size() &&
@@ -1213,6 +1216,7 @@ void CopyStagingOutputsToOrt(const StagingBindResult& bind,
         i < bind.bound_output_data.size(); ++i)
     {
         const auto oi{bind.prog_output_indices[i]};
+        const auto ort_i{OrtIndexForMgxOutput(mgx_to_ort, oi)};
         // Staging source pointer resolved once at bind time (no map lookup here).
         void* const src{bind.bound_output_data[i]};
         // Bucket shapes were precomputed at bind time; reuse the cached ORT (int64)
@@ -1234,7 +1238,7 @@ void CopyStagingOutputsToOrt(const StagingBindResult& bind,
         int seq_axis{-1};
         if (seq.active && seq.output_axes_by_index != nullptr && seq.target_len > seq.real_len &&
             !batch_sliced) {
-            if (const auto it{seq.output_axes_by_index->find(oi)}; it != seq.output_axes_by_index->end()) {
+            if (const auto it{seq.output_axes_by_index->find(ort_i)}; it != seq.output_axes_by_index->end()) {
                 const int axis{it->second};
                 if (axis >= 0 && static_cast<std::size_t>(axis) < cached_ort_shape.size() &&
                     static_cast<std::size_t>(cached_ort_shape[axis]) == seq.target_len) {
@@ -1263,7 +1267,7 @@ void CopyStagingOutputsToOrt(const StagingBindResult& bind,
             report_shape = &sliced_shape;
         }
 
-        auto output_tensor{ctx.GetOutput(oi, report_shape->data(), report_shape->size())};
+        auto output_tensor{ctx.GetOutput(ort_i, report_shape->data(), report_shape->size())};
         void* dst{output_tensor.GetTensorMutableRawData()};
 
         if (seq_axis >= 0) {
@@ -1362,7 +1366,8 @@ void DestroyHipGraphsFor(ComputeState& cs, ShapeKey shape_key) {
 // to the matching ORT output tensor, device-to-device.  Shared by the staging,
 // direct, and no-graph eager paths.
 void CopyUnboundOutputsToOrt(const Ort::KernelContext& ctx, hipStream_t stream,
-    migraphx::arguments& outputs, const std::vector<std::size_t>& prog_output_indices)
+    migraphx::arguments& outputs, const std::vector<std::size_t>& prog_output_indices,
+    const std::vector<std::size_t>& mgx_to_ort)
 {
     const std::unordered_set<std::size_t> pre_bound{
         prog_output_indices.begin(), prog_output_indices.end()};
@@ -1374,7 +1379,8 @@ void CopyUnboundOutputsToOrt(const Ort::KernelContext& ctx, hipStream_t stream,
         const auto shape{out.get_shape()};
         const auto lens{shape.lengths()};
         std::vector<std::int64_t> ort_shape{lens.begin(), lens.end()};
-        auto dst{ctx.GetOutput(i, ort_shape.data(), ort_shape.size())};
+        auto dst{ctx.GetOutput(OrtIndexForMgxOutput(mgx_to_ort, i),
+            ort_shape.data(), ort_shape.size())};
         if (shape.bytes() > 0) {
             HIP_CALL_THROW(hipMemcpyWithStream(dst.GetTensorMutableRawData(), out.data(),
                 shape.bytes(), hipMemcpyDeviceToDevice, stream));
@@ -1398,7 +1404,7 @@ static void RunProgramEagerCopyingExtras(ComputeState& cs, hipStream_t stream,
     if (!outputs) {
         return;
     }
-    CopyUnboundOutputsToOrt(ctx, stream, *outputs, prog_output_indices);
+    CopyUnboundOutputsToOrt(ctx, stream, *outputs, prog_output_indices, cs.mgx_output_to_ort);
 }
 
 void RunProgramOrHipGraph(ComputeState& cs, hipStream_t stream,
@@ -1439,7 +1445,7 @@ void RunProgramOrHipGraph(ComputeState& cs, hipStream_t stream,
             ResetCapturedGraph(*entry);
         } else {
             ReplayHipGraph(stream, *entry, bind.scratch_slot);
-            MaterializeExtraOutputs(ctx, stream, entry->extra_outputs, dyn);
+            MaterializeExtraOutputs(ctx, stream, entry->extra_outputs, dyn, cs.mgx_output_to_ort);
             return;
         }
     }
@@ -1451,7 +1457,7 @@ void RunProgramOrHipGraph(ComputeState& cs, hipStream_t stream,
     // Capture created (or reused) the entry node; (re)cache the pointer so the next
     // call replays without a lookup.
     bind.graph = &cs.hip_graph_cache[shape_key];
-    MaterializeExtraOutputs(ctx, stream, bind.graph->extra_outputs, dyn);
+    MaterializeExtraOutputs(ctx, stream, bind.graph->extra_outputs, dyn, cs.mgx_output_to_ort);
 }
 
 void RunProgramOrHipGraphDirect(ComputeState& cs, hipStream_t stream,
@@ -1527,7 +1533,7 @@ void RunProgramOrHipGraphDirect(ComputeState& cs, hipStream_t stream,
                 }
             }
             HIP_CALL_THROW(hipGraphLaunch(entry->exec, stream));
-            MaterializeExtraOutputs(ctx, stream, entry->extra_outputs, dyn);
+            MaterializeExtraOutputs(ctx, stream, entry->extra_outputs, dyn, cs.mgx_output_to_ort);
             return;
         }
     }
@@ -1540,7 +1546,7 @@ void RunProgramOrHipGraphDirect(ComputeState& cs, hipStream_t stream,
         eager_run_with_extras();
         return;
     }
-    MaterializeExtraOutputs(ctx, stream, dbc.graph->extra_outputs, dyn);
+    MaterializeExtraOutputs(ctx, stream, dbc.graph->extra_outputs, dyn, cs.mgx_output_to_ort);
 }
 
 }  // namespace mgx_ep

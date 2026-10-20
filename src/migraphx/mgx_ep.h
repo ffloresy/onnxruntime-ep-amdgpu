@@ -298,6 +298,10 @@ struct ComputeState {
     // JSON-escaped for backend-option delivery.
     std::vector<std::string> problem_cache_paths{};
 
+    // #output_N (GraphToProto / MIGraphX program order) -> ORT fused-node GetOutput index.
+    // Empty means identity (N -> N), used until Compile fills the table.
+    std::vector<std::size_t> mgx_output_to_ort{};
+
     // ── Configuration (set at Compile time) ──────────────────────────────────
     bool hip_graph_enable{};
     std::size_t max_dynamic_batch{};

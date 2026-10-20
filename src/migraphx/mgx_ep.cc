@@ -1277,6 +1277,22 @@ Ort::Status ExecutionProvider::CreateNodeComputeInfoFromGraph(const Ort::ConstGr
 
     std::vector<std::string> input_names, output_names;
     const auto has_input_shape{get_input_output_names(sorted_graph, input_names, output_names)};
+
+    // #output_N follows GraphToProto graph.output order after the Kahn sort; ORT
+    // GetOutput(N) follows fused-node order. Map by ONNX name so the compiled
+    // tensor is bound to the matching fused-node slot.
+    std::vector<std::size_t> mgx_output_to_ort(
+        static_cast<std::size_t>(model_proto.graph().output_size()));
+    for (int i = 0; i < model_proto.graph().output_size(); ++i) {
+        const auto name{model_proto.graph().output(i).name()};
+        const auto it{output_name_indices.find(name)};
+        if (it == output_name_indices.end()) {
+            return Ort::Status{("MIGraphX output has no ORT fused-node slot: " + name).c_str(),
+                ORT_EP_FAIL};
+        }
+        mgx_output_to_ort[static_cast<std::size_t>(i)] = it->second;
+    }
+
     fs::path model_path{graph.GetModelPath()};
 
     // If context_enable is set but cache_dir isn't, default to context_file_path's or the
@@ -1386,6 +1402,7 @@ Ort::Status ExecutionProvider::CreateNodeComputeInfoFromGraph(const Ort::ConstGr
 
     // Propagate hipGraph / dynamic-batch configuration onto the compute state.
     auto& compute_state{state_it->second};
+    compute_state.mgx_output_to_ort = std::move(mgx_output_to_ort);
     compute_state.hip_graph_enable = hip_graph_enable_;
     // Co-residency and dynamic batching both own the program cache's population
     // policy; dynamic batching already retains every compiled bucket, so the flag
@@ -2271,7 +2288,8 @@ std::optional<Ort::Status> TryDirectBind(ComputeState& compute_state,
         dbc.cur_output_ptrs.resize(dbc.outputs.size());
         for (std::size_t i{0}; i < dbc.outputs.size(); ++i) {
             const auto& out{dbc.outputs[i]};
-            auto output_tensor{kernel_context.GetOutput(out.output_index,
+            auto output_tensor{kernel_context.GetOutput(
+                OrtIndexForMgxOutput(compute_state.mgx_output_to_ort, out.output_index),
                 out.ort_shape.data(), out.ort_shape.size())};
             dbc.cur_output_ptrs[i] = output_tensor.GetTensorMutableRawData();
         }
@@ -2342,7 +2360,8 @@ std::optional<Ort::Status> TryStaging(ComputeState& compute_state,
                     hip::ArmOutputAlloc(stage_it->second.data, stage_it->second.size_bytes);
                 }
                 OutputHintGuard hint_guard;
-                auto output_tensor{kernel_context.GetOutput(out.output_index,
+                auto output_tensor{kernel_context.GetOutput(
+                    OrtIndexForMgxOutput(compute_state.mgx_output_to_ort, out.output_index),
                     out.ort_shape.data(), out.ort_shape.size())};
                 hyb.cur_output_ptrs[i] = output_tensor.GetTensorMutableRawData();
             }
@@ -2354,7 +2373,8 @@ std::optional<Ort::Status> TryStaging(ComputeState& compute_state,
         } else {
         RunProgramOrHipGraph(compute_state, hip_stream, kernel_context, program,
                 bind, shape_key, dyn);
-            CopyStagingOutputsToOrt(bind, kernel_context, hip_stream, dyn, seq);
+            CopyStagingOutputsToOrt(bind, kernel_context, hip_stream, dyn, seq,
+                compute_state.mgx_output_to_ort);
         }
         return STATUS_OK;
     }
@@ -2393,15 +2413,16 @@ Ort::Status RunEager(ComputeState& compute_state,
                 void* input_data{GetGpuInputData(compute_state, kernel_context, name, index, prog_shape, hip_stream)};
                 compute_params.add(name.c_str(), migraphx::argument{prog_shape, input_data});
             } else if (const auto oi{ComputeOutputIndex(name)}; oi != -1) {
-                // Output argument (#output_N): reuse the shared parser instead of an
-                // inline find/Trim/ToInteger of the index.
-                const auto output_index{static_cast<size_t>(oi)};
-                    output_indices.emplace_back(output_index);
+                // #output_N indexes the MIGraphX program; GetOutput uses the name remap.
+                const auto mgx_index{static_cast<size_t>(oi)};
+                    output_indices.emplace_back(mgx_index);
 
-                    auto output_shape{output_shapes[output_index]};
+                    auto output_shape{output_shapes[mgx_index]};
                     const auto lengths{output_shape.lengths()};
                     std::vector<int64_t> tensor_shape{lengths.begin(), lengths.end()};
-                    auto output_tensor{kernel_context.GetOutput(output_index, tensor_shape.data(), tensor_shape.size())};
+                    auto output_tensor{kernel_context.GetOutput(
+                        OrtIndexForMgxOutput(compute_state.mgx_output_to_ort, mgx_index),
+                        tensor_shape.data(), tensor_shape.size())};
                     void* output_data{output_tensor.GetTensorMutableRawData()};
                     auto argument_shape{param_shapes[name.c_str()]};
                     compute_params.add(name.c_str(), migraphx::argument{argument_shape, output_data});
@@ -2415,7 +2436,8 @@ Ort::Status RunEager(ComputeState& compute_state,
         std::lock_guard lock{compute_state.mutex};
 
         auto prog_outputs{program.run_async(compute_params, hip_stream)};
-        CopyUnboundOutputsToOrt(kernel_context, hip_stream, prog_outputs, output_indices);
+        CopyUnboundOutputsToOrt(kernel_context, hip_stream, prog_outputs, output_indices,
+            compute_state.mgx_output_to_ort);
     }
     return STATUS_OK;
 }
